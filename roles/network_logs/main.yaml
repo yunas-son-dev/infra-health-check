@@ -1,0 +1,57 @@
+    - name: Check if systemd journal exists
+      ansible.builtin.stat:
+        path: /run/systemd/journal
+      register: journal_path
+      changed_when: false
+
+    - name: Extract network-related entries from systemd journal
+      ansible.builtin.shell: |
+        set -o pipefail
+        journalctl | grep -i 'network'
+      register: journal_output
+      ignore_errors: true
+      changed_when: false
+
+    - name: Extract network-related entries from /var/log/syslog
+      ansible.builtin.command: grep -i 'network' /var/log/syslog
+      register: syslog_output
+      changed_when: false
+      failed_when: >-
+        syslog_output.rc != 0 and
+        'No such file or directory' not in syslog_output.stderr
+
+    - name: Extract network-related entries from /var/log/messages
+      ansible.builtin.command: grep -i 'network' /var/log/messages
+      register: messages_output
+      changed_when: false
+      failed_when: >-
+        messages_output.rc != 0 and
+        'No such file or directory' not in messages_output.stderr
+
+    - name: Extract network-related entries from dmesg
+      ansible.builtin.shell: |
+        set -o pipefail
+        dmesg | grep -i 'network'
+      register: dmesg_output
+      ignore_errors: true
+      changed_when: false
+
+    - name: Show systemd journal network-related entries
+      ansible.builtin.debug:
+        msg: "{{ journal_output.stdout }}"
+      when: journal_output.stdout is defined and journal_output.stdout != ""
+
+    - name: Show /var/log/syslog network-related entries
+      ansible.builtin.debug:
+        msg: "{{ syslog_output.stdout }}"
+      when: syslog_output.stdout is defined and syslog_output.stdout != ""
+
+    - name: Show /var/log/messages network-related entries
+      ansible.builtin.debug:
+        msg: "{{ messages_output.stdout }}"
+      when: messages_output.stdout is defined and messages_output.stdout != ""
+
+    - name: Show dmesg network-related entries
+      ansible.builtin.debug:
+        msg: "{{ dmesg_output.stdout }}"
+      when: dmesg_output.stdout != ""

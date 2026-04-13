@@ -1,0 +1,7 @@
+---
+- name:
+  hosts: all
+  gather_facts: true
+  roles:
+    - role: fan_speed
+

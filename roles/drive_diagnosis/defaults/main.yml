@@ -1,0 +1,35 @@
+---
+# Default variables for drive_diagnosis role
+
+# Critical attribute definitions
+critical_attributes:
+  - id: 1
+    name: Raw_Read_Error_Rate
+    ignore_for_seagate: true
+  - id: 5
+    name: Reallocated_Sector_Ct
+    ignore_for_seagate: false
+  - id: 7
+    name: Seek_Error_Rate
+    ignore_for_seagate: true
+  - id: 10
+    name: Spin_Retry_Count
+    ignore_for_seagate: false
+  - id: 187
+    name: Reported_Uncorrect
+    ignore_for_seagate: false
+  - id: 188
+    name: Command_Timeout
+    ignore_for_seagate: false
+  - id: 196
+    name: Reallocation_Event_Count
+    ignore_for_seagate: false
+  - id: 197
+    name: Current_Pending_Sector
+    ignore_for_seagate: false
+  - id: 198
+    name: Offline_Uncorrectable
+    ignore_for_seagate: false
+  - id: 199
+    name: UDMA_CRC_Error_Count
+    ignore_for_seagate: false

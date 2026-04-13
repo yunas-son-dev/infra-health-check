@@ -1,0 +1,259 @@
+# Tasks for processing MegaRAID disk
+
+# Use a block to handle errors gracefully
+- name: Process MegaRAID disk with error handling
+  block:
+    # Ensure initialization of key variables
+    - name: Ensure variables are initialized
+      set_fact:
+        smart_attributes: []
+        device_model_family: "Unknown Family"
+        device_model: "Unknown Model"
+        device_serial: "Unknown Serial"
+        overall_health_passed: false
+        failing_attributes_list: []  # Use a different name to avoid conflicts
+        has_critical_errors: false
+      when: true  # Always run this
+
+    # Extract basic device info from JSON (for newer smartctl)
+    - name: Extract basic device info and health status from JSON (for newer smartctl)
+      set_fact:
+        device_model_family: "{{ smart_data_json.model_family | default('') }}"
+        device_model: "{{ smart_data_json.device.model_name | default(smart_data_json.model_name | default('Unknown Model')) }}"
+        device_serial: "{{ smart_data_json.serial_number | default('Unknown Serial') }}"
+        overall_health_passed: "{{ smart_data_json.smart_status.passed | default(false) }}"
+        smart_attributes: "{{ smart_data_json.ata_smart_attributes.table | default(smart_data_json.nvme_smart_health_information_log.attributes | default([])) }}"
+      when: smart_attempt_type == "megaraid_json" and smart_data_json is defined
+
+    # Save raw output for debugging
+    - name: Save raw smartctl output to file
+      copy:
+        content: "{{ smart_data_text | default('No data available') }}"
+        dest: "/tmp/smart_data_raw_{{ inventory_hostname }}_{{ disk_name }}.txt"
+      delegate_to: localhost
+      become: false
+      when: smart_data_text is defined and smart_attempt_type == "megaraid_text"
+
+    # Extract basic device info from text output (for older smartctl)
+    - name: Extract basic device info from text output (for older smartctl)
+      set_fact:
+        device_model_family: "{{ (smart_data_text | regex_search('Model Family:\\s+(.+)$', '\\1', multiline=True) or ['']) | first | default('') }}"
+        device_model: "{{ (smart_data_text | regex_search('Device Model:\\s+(.+)$', '\\1', multiline=True) or ['Unknown Model']) | first }}"
+        device_serial: "{{ (smart_data_text | regex_search('Serial Number:\\s+(.+)$', '\\1', multiline=True) or ['Unknown Serial']) | first }}"
+        overall_health_passed: "{{ 'PASSED' in ((smart_data_text | regex_search('SMART overall-health self-assessment test result:\\s+(.+)$', '\\1', multiline=True) or ['']) | first | default('')) }}"
+      when: smart_attempt_type == "megaraid_text" and smart_data_text is defined
+
+    # Determine if drive is Seagate
+    - name: Determine if drive is Seagate
+      set_fact:
+        is_seagate: "{{ ((device_model_family | default('')) + (device_model | default(''))) | lower | regex_search('seagate|st[0-9]+') }}"
+
+    # Debug smart_attributes
+    # ==================================================================================
+    # =========================== THIS IS ONLY FOR DEBUGGING ===========================
+    # ==================================================================================
+    # - name: Debug smart_attributes content
+    #   debug:
+    #     msg:
+    #       - "First attribute sample: {{ smart_attributes[0] if smart_attributes|length > 0 else 'none' }}"
+    #       - "Attribute count: {{ smart_attributes|length }}"
+    #       - "Raw type: {{ smart_attributes|type_debug }}"
+    #     verbosity: 1
+    #   when: smart_attributes is defined
+
+    # Comprehensive attribute check
+    - name: Check each MegaRAID attribute for failures (comprehensive)
+      set_fact:
+        failing_attributes_list: "{{ failing_attributes_list + [{'name': item.name|default('Unknown'), 'id': item.id|default('?'), 'raw_value': (item.raw.value|default(0) if item.raw is defined else item.value|default(0))}] }}"
+      when: >
+        item is mapping and 
+        item.name is defined and
+        item.id is defined and
+        (item.id|string in ['5', '10', '184', '187', '188', '196', '197', '198', '199'] or
+         item.name in ['Reallocated_Sector_Ct', 'Spin_Retry_Count', 'Current_Pending_Sector', 
+                      'Reported_Uncorrect', 'Command_Timeout', 'Reallocation_Event_Count',
+                      'Offline_Uncorrectable', 'UDMA_CRC_Error_Count'])
+        and not (is_seagate|default(false) and item.id|string in ['1', '7'])
+        and ((item.raw is defined and item.raw.value|default(0)|int > 0) 
+             or (item.raw is not defined and item.value is defined and item.value|default(0)|int > 0))
+      with_items: "{{ smart_attributes|default([]) }}"
+      loop_control:
+        label: "{{ item.name|default('Unknown')|truncate(20, True) if item is mapping else 'non-dict-item' }}"
+
+    # --- Check Extended Error Log for UNC/IDNF errors for MegaRAID disk ---
+    - name: Check SMART extended error log for MegaRAID disk UNC and IDNF errors
+      command: "smartctl -l xerror -d megaraid,0 {{ device_path }}"
+      register: xerror_output_megaraid
+      changed_when: false
+      become: true
+      ignore_errors: true
+
+    - name: Parse extended error log for critical errors (MegaRAID)
+      set_fact:
+        unc_errors_megaraid: "{{ xerror_output_megaraid.stdout | regex_findall('ER.*?\\n.*?\\n[^\\n]*?40 --') | list }}"
+        idnf_errors_megaraid: "{{ xerror_output_megaraid.stdout | regex_findall('ER.*?\\n.*?\\n[^\\n]*?10 --') | list }}"
+      when: xerror_output_megaraid is defined and xerror_output_megaraid.stdout is defined
+
+    - name: Add UNC errors if found
+      set_fact:
+        failing_attributes_list: "{{ failing_attributes_list + [{'name': 'Extended_UNC_Errors', 'id': 'xerror', 'raw_value': unc_errors_megaraid | length}] }}"
+      when: unc_errors_megaraid is defined and unc_errors_megaraid | length > 0
+
+    - name: Add IDNF errors if found
+      set_fact:
+        failing_attributes_list: "{{ failing_attributes_list + [{'name': 'Extended_IDNF_Errors', 'id': 'xerror', 'raw_value': idnf_errors_megaraid | length}] }}"
+      when: idnf_errors_megaraid is defined and idnf_errors_megaraid | length > 0
+
+    - name: Add xerror output to report details (MegaRAID)
+      set_fact:
+        xerror_details: "{% if (unc_errors_megaraid is defined and unc_errors_megaraid | length > 0) or (idnf_errors_megaraid is defined and idnf_errors_megaraid | length > 0) %}Extended Error Log Analysis:
+          {% if unc_errors_megaraid is defined and unc_errors_megaraid | length > 0 %}UNC Errors Found: {{ unc_errors_megaraid | length }} (ERROR CODE 40) - DRIVE SHOULD BE REPLACED{% endif %}
+          {% if idnf_errors_megaraid is defined and idnf_errors_megaraid | length > 0 %}IDNF Errors Found: {{ idnf_errors_megaraid | length }} (ERROR CODE 10) - DRIVE SHOULD BE REPLACED{% endif %}{% else %}No UNC or IDNF errors found in Extended Error Log{% endif %}"
+
+    # Debug failing attributes
+    - name: Debug failing attributes
+      debug:
+        msg:
+          - "Failing attributes found: {{ failing_attributes_list|length }}"
+          - "Content: {{ failing_attributes_list }}"
+        verbosity: 1
+      
+    # Very simple warning message construction - SET FLAG INSTEAD OF FAILING
+    - name: Create warning message text
+      set_fact:
+        disk_warning_message: ""  # Start empty
+
+    - name: Add warning message and set critical flag if failures found
+      set_fact:
+        disk_warning_message: "WARNING: Disk has errors. Please raise with DC!"
+        has_critical_errors: true
+        has_disk_errors: true  # Parent playbook variable to track failed hosts
+      when: failing_attributes_list|length > 0 or (unc_errors_megaraid is defined and unc_errors_megaraid|length > 0) or (idnf_errors_megaraid is defined and idnf_errors_megaraid|length > 0)
+
+    # Set overall status text
+    - name: Set disk status messages for MegaRAID disk
+      set_fact:
+        disk_overall_status_text: "SMART overall-health self-assessment test result: {{ 'PASSED' if overall_health_passed else 'FAILED' }}"
+
+    # Format the complete output
+    - name: Format complete output for MegaRAID disk
+      set_fact:
+        complete_output: |
+          MegaRAID controller detected - using SMART device type: {{ smart_attempt_type }}
+          {% if device_model_family %}
+          Model Family:     {{ device_model_family }}
+          {% endif %}
+          Device Model:     {{ device_model }}
+          Serial Number:    {{ device_serial }}
+          {% if smart_attributes is sequence and smart_attributes|length > 0 %}
+          ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE
+          {% for attr in smart_attributes %}
+          {{ "%-3s" | format(attr.id | default('?')) }} {{ "%-24s" | format(attr.name | default('?')) }} {{ "%-8s" | format(attr.flags.string | default('-')) }} {{ "%-5s" | format(attr.value | default('-')) }} {{ "%-5s" | format(attr.worst | default('-')) }} {{ "%-6s" | format(attr.thresh | default('-')) }} {{ "%-10s" | format(attr.type | default(attr.flags.type | default('-'))) }} {{ "%-8s" | format(attr.updated | default(attr.flags.updated | default('-'))) }} {{ "%-11s" | format(attr.when_failed | default('-')) }} {{ attr.raw.string | default(attr.raw.value | default(attr.value | default('-'))) }}
+          {% endfor %}
+          {% else %}
+          !!! No SMART attributes could be parsed - see raw output for details !!!
+          {% endif %}
+          
+          {% if is_seagate %}
+          This is a Seagate model. You can ignore Raw_Read_Error_Rate and Seek_Error_Rate
+          {% endif %}
+          
+          {% if xerror_details is defined and xerror_details|length > 0 %}
+          {{ xerror_details }}
+          {% endif %}
+          
+          {% if failing_attributes_list|length > 0 %}
+          {{ disk_warning_message }}
+          
+          Critical attributes with non-zero values:
+          {% for attr in failing_attributes_list %}
+          - {{ attr.name }} (ID: {{ attr.id }}) (Raw value: {{ attr.raw_value }})
+          {% endfor %}
+          {% endif %}
+          
+          {{ disk_overall_status_text }}
+
+          {% if smart_attributes|length == 0 and smart_data_text is defined %}
+          
+          === RAW TEXT OUTPUT BELOW FOR REFERENCE ===
+          {{ smart_data_text }}
+          {% endif %}
+
+          {% if disk_is_failing %}
+          !!! CRITICAL: DISK IS FAILING (smartctl returned error code 64) !!!
+          !!! DRIVE SHOULD BE REPLACED IMMEDIATELY !!!
+          {% endif %}
+
+    # Create output file with results
+    - name: Create output file for {{ inventory_hostname }}/{{ disk_name }}
+      copy:
+        content: |
+          ===== Host: {{ inventory_hostname }} ({{ disk_type }}) =====
+          <Checking disk {{ disk_name }} - MegaRAID> [smartctl version: {{ smartctl_version | default('unknown') }} - {{ "JSON mode" if json_supported else "TEXT mode" }}]
+          {{ complete_output }}
+        dest: "/tmp/smart_result_{{ inventory_hostname }}_{{ disk_name }}_megaraid.txt"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    # Display the file contents
+    - name: Display contents of result file for MegaRAID disk
+      shell: "cat /tmp/smart_result_{{ inventory_hostname }}_{{ disk_name }}_megaraid.txt | expand -t 4"
+      delegate_to: localhost
+      become: false
+      register: megaraid_output
+      changed_when: false
+
+    # THIS IS KEY - Save output BEFORE any failures
+    - name: Save MegaRAID SMART output to collection
+      set_fact:
+        smart_outputs: "{{ hostvars[inventory_hostname]['smart_outputs'] | default([]) + megaraid_output.stdout_lines }}"
+
+    # Clean up output file
+    - name: Clean up output file
+      file:
+        path: "/tmp/smart_result_{{ inventory_hostname }}_{{ disk_name }}_megaraid.txt"
+        state: absent
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+  # This runs if any task in the block fails
+  rescue:
+    - name: Record failure
+      set_fact:
+        disk_check_failed: true
+        has_disk_errors: true
+
+  # This always runs whether block succeeded or failed
+  always:
+    - name: Ensure disk error flag is set properly
+      set_fact:
+        has_disk_errors: "{{ has_critical_errors | default(false) or disk_check_failed | default(false) }}"
+
+# This debug task just displays the error message but doesn't stop execution
+- name: Display critical disk error message for MegaRAID
+  debug:
+    msg: |
+      ===== CRITICAL DISK ERRORS DETECTED (MegaRAID) =====
+      Host: {{ inventory_hostname }}
+      Device: /dev/{{ disk_name }}
+      
+      {% if (unc_errors_megaraid is defined and unc_errors_megaraid | length > 0) %}
+      UNC Errors Found: {{ unc_errors_megaraid | length }} (ERROR CODE 40)
+      !!! DRIVE SHOULD BE REPLACED IMMEDIATELY !!!
+      {% endif %}
+      
+      {% if (idnf_errors_megaraid is defined and idnf_errors_megaraid | length > 0) %}
+      IDNF Errors Found: {{ idnf_errors_megaraid | length }} (ERROR CODE 10)
+      !!! DRIVE SHOULD BE REPLACED IMMEDIATELY !!!
+      {% endif %}
+      
+      {% if failing_attributes_list is defined and failing_attributes_list | length > 0 %}
+      Critical SMART attributes found - DRIVE REQUIRES ATTENTION!
+      {% endif %}
+      
+      {% if disk_is_failing %}
+      !!! DISK IS FAILING (smartctl error code 64) - REQUIRES IMMEDIATE REPLACEMENT !!!
+      {% endif %}
+  when: has_critical_errors | default(false) or disk_is_failing | default(false)

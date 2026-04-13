@@ -1,0 +1,480 @@
+# tasks file for smart_check_loop.yml
+
+# Initialize variables for the current disk loop iteration
+- name: Initialize SMART data and disk type for {{ disk_name }}
+  set_fact:
+    smart_data_json: null
+    smart_data_text: null
+    smart_attempt_type: "none"
+    smart_error_message: "Not attempted yet"
+    disk_type: "{{ storage_type | default('Unknown') }}"
+    megaraid_message_printed: false
+    megaraid_found_disk: false
+    failing_attributes: []  # Initialize as empty list
+    has_critical_errors: false
+    disk_is_failing: false
+
+- name: Set JSON support to false if version check failed
+  set_fact:
+    json_supported: false
+  when: smartctl_version is not defined
+
+# --- Prepare full device path ---
+- name: Set device path
+  set_fact:
+    device_path: "/dev/{{ disk_name }}"
+
+# --- STANDARD DISK PATH: Try appropriate SMART command based on version ---
+- name: Try standard SMART command with JSON (for newer smartctl)
+  command: "smartctl --json -a {{ device_path }}"
+  register: smart_cmd_standard_json
+  failed_when: false  
+  changed_when: false
+  become: true
+  ignore_errors: true
+  when: not has_megaraid and json_supported|bool
+
+- name: Try standard SMART command without JSON (for older smartctl)
+  command: "smartctl -a {{ device_path }}"
+  register: smart_cmd_standard_text
+  failed_when: false  
+  changed_when: false
+  become: true
+  ignore_errors: true
+  when: not has_megaraid and not json_supported|bool
+
+# --- MEGARAID PATH: Try appropriate SMART command based on version ---
+- name: Try MegaRAID SMART command with JSON (for newer smartctl)
+  command: "smartctl --json -a -d megaraid,0 {{ device_path }}"
+  register: smart_cmd_megaraid_json
+  failed_when: false  
+  changed_when: false
+  become: true
+  ignore_errors: true
+  when: has_megaraid and json_supported|bool
+
+- name: Try MegaRAID SMART command without JSON (for older smartctl)
+  command: "smartctl -a -d megaraid,0 {{ device_path }}"
+  register: smart_cmd_megaraid_text
+  failed_when: false  
+  changed_when: false
+  become: true
+  ignore_errors: true
+  when: has_megaraid and not json_supported|bool
+
+# --- Check if disk is failing based on return code 64 ---
+- name: Check if disk is failing (return code 64) - Standard Disk with JSON
+  set_fact:
+    disk_is_failing: true
+    has_disk_errors: true
+    has_critical_errors: true
+  when: >
+    not has_megaraid and json_supported|bool and 
+    smart_cmd_standard_json.rc == 64
+
+- name: Check if disk is failing (return code 64) - Standard Disk with Text
+  set_fact:
+    disk_is_failing: true
+    has_disk_errors: true
+    has_critical_errors: true
+  when: >
+    not has_megaraid and not json_supported|bool and 
+    smart_cmd_standard_text.rc == 64
+
+- name: Check if disk is failing (return code 64) - MegaRAID Disk with JSON
+  set_fact:
+    disk_is_failing: true
+    has_disk_errors: true
+    has_critical_errors: true
+  when: >
+    has_megaraid and json_supported|bool and 
+    smart_cmd_megaraid_json.rc == 64
+
+- name: Check if disk is failing (return code 64) - MegaRAID Disk with Text
+  set_fact:
+    disk_is_failing: true
+    has_disk_errors: true
+    has_critical_errors: true
+  when: >
+    has_megaraid and not json_supported|bool and 
+    smart_cmd_megaraid_text.rc == 64
+
+# --- MEGARAID PATH: Set flag if we retrieved JSON data ---
+- name: Set MegaRAID disk found flag (JSON)
+  set_fact:
+    megaraid_found_disk: true
+    megaraid_message_printed: true
+    smart_data_json: "{{ smart_cmd_megaraid_json.stdout | from_json }}"
+    smart_attempt_type: "megaraid_json"
+  when: >
+    has_megaraid and json_supported|bool and
+    smart_cmd_megaraid_json.rc in [0, 2, 4, 8, 64] and 
+    smart_cmd_megaraid_json.stdout is defined and 
+    smart_cmd_megaraid_json.stdout != ""
+
+# --- MEGARAID PATH: Set flag if we retrieved text data ---
+- name: Set MegaRAID disk found flag (text)
+  set_fact:
+    megaraid_found_disk: true
+    megaraid_message_printed: true
+    smart_data_text: "{{ smart_cmd_megaraid_text.stdout }}"
+    smart_attempt_type: "megaraid_text"
+  when: >
+    has_megaraid and not json_supported|bool and
+    smart_cmd_megaraid_text.rc in [0, 2, 4, 8, 64] and 
+    smart_cmd_megaraid_text.stdout is defined and 
+    smart_cmd_megaraid_text.stdout != ""
+
+# --- MEGARAID PATH: Process MegaRAID results ---
+- name: Process SMART data for MegaRAID disk
+  include_tasks: process_megaraid_disk.yml
+  when: has_megaraid and megaraid_found_disk | bool
+
+# --- STANDARD DISK PATH: Process standard SMART JSON result ---
+- name: Process standard SMART JSON result
+  set_fact:
+    smart_data_json: "{{ smart_cmd_standard_json.stdout | from_json }}"
+    smart_attempt_type: "standard_json"
+    smart_error_message: ""
+  when: >
+    not has_megaraid and json_supported|bool and
+    smart_cmd_standard_json.rc in [0, 2, 4, 8, 64] and 
+    smart_cmd_standard_json.stdout is defined and 
+    smart_cmd_standard_json.stdout != ""
+  ignore_errors: true
+
+# --- STANDARD DISK PATH: Process standard SMART text result ---
+- name: Process standard SMART text result
+  set_fact:
+    smart_data_text: "{{ smart_cmd_standard_text.stdout }}"
+    smart_attempt_type: "standard_text"
+    smart_error_message: ""
+  when: >
+    not has_megaraid and not json_supported|bool and
+    smart_cmd_standard_text.rc in [0, 2, 4, 8, 64] and 
+    smart_cmd_standard_text.stdout is defined and 
+    smart_cmd_standard_text.stdout != ""
+  ignore_errors: true
+
+# --- STANDARD DISK PATH: Set error message if standard check failed ---
+- name: Set error message for failed standard check
+  set_fact:
+    smart_error_message: "Unable to read SMART data from {{ device_path }}"
+  when: >
+    not has_megaraid and
+    ((json_supported|bool and smart_cmd_standard_json.rc not in [0, 2, 4, 8, 64]) or
+     (not json_supported|bool and smart_cmd_standard_text.rc not in [0, 2, 4, 8, 64]))
+
+# --- MEGARAID PATH: Set error message if MegaRAID check failed ---
+- name: Set error message for failed MegaRAID check
+  set_fact:
+    smart_error_message: "MegaRAID controller detected but unable to read SMART data."
+  when: has_megaraid and not megaraid_found_disk
+
+# --- STANDARD DISK PATH: Analyze and Display SMART data if data was retrieved ---
+- name: Analyze and Prepare Display String for Standard Disk
+  block:
+    # --- Extract Key Information based on output type (JSON vs Text) ---
+    - name: Extract basic device info and health status from JSON
+      set_fact:
+        device_model_family: "{{ smart_data_json.model_family | default('') }}"
+        device_model: "{{ smart_data_json.device.model_name | default(smart_data_json.model_name | default('Unknown Model')) }}"
+        device_serial: "{{ smart_data_json.serial_number | default('Unknown Serial') }}"
+        overall_health_passed: "{{ smart_data_json.smart_status.passed | default(false) }}"
+        smart_attributes: "{{ smart_data_json.ata_smart_attributes.table | default(smart_data_json.nvme_smart_health_information_log.attributes | default([])) }}"
+      when: smart_attempt_type == "standard_json"
+
+    - name: Extract basic device info from text output
+      set_fact:
+        device_model_family: "{{ (smart_data_text | regex_search('Model Family:\\s+(.+)$', '\\1', multiline=True) or ['']) | first | default('') }}"
+        device_model: "{{ (smart_data_text | regex_search('Device Model:\\s+(.+)$', '\\1', multiline=True) or ['Unknown Model']) | first }}"
+        device_serial: "{{ (smart_data_text | regex_search('Serial Number:\\s+(.+)$', '\\1', multiline=True) or ['Unknown Serial']) | first }}"
+        overall_health_passed: "{{ 'PASSED' in ((smart_data_text | regex_search('SMART overall-health self-assessment test result:\\s+(.+)$', '\\1', multiline=True) or ['']) | first | default('')) }}"
+      when: smart_attempt_type == "standard_text"
+
+    # --- Parse SMART attributes table from text output ---
+    - name: Extract SMART attributes table from text output
+      set_fact:
+        smart_attributes_text: "{{ smart_data_text | regex_findall('(\\d+)\\s+(\\S[^\\n]{1,23})\\s+([^\\s].{7})\\s+(\\d+)\\s+(\\d+)\\s+(\\d+|-)\\s+([^\\s].{9})\\s+([^\\s].{7})\\s+([^\\s].{10})\\s+(.+)$', multiline=True) }}"
+        smart_attributes: []
+      when: smart_attempt_type == "standard_text"
+
+    # --- Convert text attributes to structured format ---
+    - name: Convert text attributes to structured format
+      set_fact:
+        smart_attributes: >-
+          {% set attrs = [] %}
+          {% for attr in smart_attributes_text %}
+          {%   set _ = attrs.append({
+                 'id': attr[0] | trim,
+                 'name': attr[1] | trim,
+                 'flags': {'string': attr[2] | trim},
+                 'value': attr[3] | trim,
+                 'worst': attr[4] | trim,
+                 'thresh': attr[5] | trim,
+                 'type': attr[6] | trim,
+                 'updated': attr[7] | trim,
+                 'when_failed': attr[8] | trim,
+                 'raw': {'value': attr[9] | trim | regex_replace('[^0-9]', '') | int}
+               }) %}
+          {% endfor %}
+          {{ attrs }}
+      when: smart_attempt_type == "standard_text" and smart_attributes_text is defined
+
+    # --- Extract Key Information (Part 2 - Dependent Facts) ---
+    - name: Determine if drive is Seagate (depends on basic info)
+      set_fact:
+        is_seagate: "{{ ((device_model_family | default('')) + (device_model | default(''))) | lower | regex_search('seagate|st[0-9]+') }}"
+
+    # --- Process each attribute individually to avoid complex Jinja expressions ---
+    - name: Initialize failing attributes list
+      set_fact:
+        failing_attributes: []
+
+    - name: Check each attribute for failures
+      set_fact:
+        failing_attributes: "{{ failing_attributes + [{'name': item.name|default('Unknown'), 'id': item.id|default('?'), 'raw_value': (item.raw.value|default(0) if item.raw is defined else item.value|default(0))}] }}"
+      when: >
+        item is mapping and 
+        item.name is defined and
+        item.id is defined and
+        (item.id|string in ['5', '10', '184', '187', '188', '196', '197', '198', '199'] or
+        item.name in ['Reallocated_Sector_Ct', 'Spin_Retry_Count', 'Current_Pending_Sector', 
+                      'Reported_Uncorrect', 'Command_Timeout', 'Reallocation_Event_Count',
+                      'Offline_Uncorrectable', 'UDMA_CRC_Error_Count'])
+        and not (is_seagate|default(false) and item.id|string in ['1', '7'])
+        and ((item.raw is defined and item.raw.value|default(0)|int > 0) 
+            or (item.raw is not defined and item.value is defined and item.value|default(0)|int > 0))
+      with_items: "{{ smart_attributes|default([]) }}"
+      loop_control:
+        label: "{{ item.name|default('Unknown')|truncate(20, True) if item is mapping else 'non-dict-item' }}"
+
+    # --- Check Extended Error Log for UNC/IDNF errors (standard disks only) ---
+    - name: Check SMART extended error log for UNC and IDNF errors (standard disk)
+      command: "smartctl -l xerror {{ device_path }}"
+      register: xerror_output
+      changed_when: false
+      become: true
+      ignore_errors: true
+
+    - name: Parse extended error log for critical errors (standard disk)
+      set_fact:
+        unc_errors: "{{ xerror_output.stdout | regex_findall('ER.*?\\n.*?\\n[^\\n]*?40 --') | list }}"
+        idnf_errors: "{{ xerror_output.stdout | regex_findall('ER.*?\\n.*?\\n[^\\n]*?10 --') | list }}"
+      when: xerror_output is defined and xerror_output.stdout is defined
+
+    - name: Add extended error findings to failing attributes (standard disk)
+      set_fact:
+        failing_attributes: >-
+          {{ failing_attributes + [{'name': 'Extended_UNC_Errors', 'id': 'xerror', 'raw_value': unc_errors | length}] }}
+      when: unc_errors is defined and unc_errors | length > 0
+
+    - name: Add IDNF error findings to failing attributes (standard disk)
+      set_fact:
+        failing_attributes: >-
+          {{ failing_attributes + [{'name': 'Extended_IDNF_Errors', 'id': 'xerror', 'raw_value': idnf_errors | length}] }}
+      when: idnf_errors is defined and idnf_errors | length > 0
+
+    - name: Add xerror output to report details (standard disk)
+      set_fact:
+        xerror_details: "{% if (unc_errors is defined and unc_errors | length > 0) or (idnf_errors is defined and idnf_errors | length > 0) %}Extended Error Log Analysis:
+          {% if unc_errors is defined and unc_errors | length > 0 %}UNC Errors Found: {{ unc_errors | length }} (ERROR CODE 40) - DRIVE SHOULD BE REPLACED{% endif %}
+          {% if idnf_errors is defined and idnf_errors | length > 0 %}IDNF Errors Found: {{ idnf_errors | length }} (ERROR CODE 10) - DRIVE SHOULD BE REPLACED{% endif %}{% else %}No UNC or IDNF errors found in Extended Error Log{% endif %}"
+
+    # --- Set has_disk_errors flag if any errors were detected ---
+    # IMPORTANT CHANGE: Set flag instead of failing immediately
+    - name: Set host-level disk error flag if problems detected
+      set_fact:
+        has_disk_errors: true
+        has_critical_errors: true
+      when: >
+        (unc_errors is defined and unc_errors | length > 0) or
+        (idnf_errors is defined and idnf_errors | length > 0) or
+        (failing_attributes | length > 0)
+
+
+    # ==================================================================================
+    # =========================== THIS IS ONLY FOR DEBUGGING ===========================
+    # ==================================================================================
+    # - name: Debug failing attributes
+    #   debug:
+    #     msg: 
+    #       - "Failing Attributes List: {{ failing_attributes }}"
+    #       - "Is list empty?: {{ failing_attributes|length == 0 }}"
+    #       - "Data type: {{ failing_attributes|type_debug }}"
+    #     verbosity: 1  # Only show with -v
+
+    # --- Set status messages based on findings ---
+    - name: Set disk status messages
+      set_fact:
+        disk_overall_status_text: "SMART overall-health self-assessment test result: {{ 'PASSED' if overall_health_passed else 'FAILED' }}"
+        disk_warning_message: "{% if failing_attributes|length > 0 %}WARNING: Disk has errors in attributes: {% for attr in failing_attributes %}
+          - {{ attr.name }} (ID: {{ attr.id }}) (Raw value: {{ attr.raw_value }})
+          {% endfor %}
+          Please raise with DC!{% endif %}"
+
+    # --- Format the complete output as a single string ---
+    - name: Format complete output for /dev/{{ disk_name }}
+      set_fact:
+        complete_output: |
+          {% if device_model_family %}
+          Model Family:     {{ device_model_family }}
+          {% endif %}
+          Device Model:     {{ device_model }}
+          Serial Number:    {{ device_serial }}
+          {% if smart_data_text is defined and smart_data_text and smart_attempt_type == "standard_text" %}
+          === TEXT MODE OUTPUT (Older smartctl version {{ smartctl_version | default('unknown') }}) ===
+          {% elif smart_attributes | length > 0 %}
+          ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE
+          {% for attr in smart_attributes %}
+          {{ "%-3s" | format(attr.id | default('?')) }} {{ "%-24s" | format(attr.name | default('?')) }} {{ "%-8s" | format(attr.flags.string | default('-')) }} {{ "%-5s" | format(attr.value | default('-')) }} {{ "%-5s" | format(attr.worst | default('-')) }} {{ "%-6s" | format(attr.thresh | default('-')) }} {{ "%-10s" | format(attr.type | default(attr.flags.type | default('-'))) }} {{ "%-8s" | format(attr.updated | default(attr.flags.updated | default('-'))) }} {{ "%-11s" | format(attr.when_failed | default('-')) }} {{ attr.raw.string | default(attr.raw.value | default(attr.value | default('-'))) }}
+          {% endfor %}
+          {% endif %}
+          
+          {% if is_seagate %}
+          This is a Seagate model. You can ignore Raw_Read_Error_Rate and Seek_Error_Rate
+          {% endif %}
+          
+          {% if xerror_details is defined %}
+          {{ xerror_details }}
+          {% endif %}
+          
+          {% if failing_attributes|length > 0 %}
+          {{ disk_warning_message }}
+          {% endif %}
+          
+          {{ disk_overall_status_text }}
+
+          {% if smart_data_text is defined and smart_data_text and smart_attempt_type == "standard_text" %}
+          
+          === RAW TEXT OUTPUT BELOW FOR REFERENCE ===
+          {{ smart_data_text }}
+          {% endif %}
+
+          {% if disk_is_failing %}
+          !!! CRITICAL: DISK IS FAILING (smartctl returned error code 64) !!!
+          !!! DRIVE SHOULD BE REPLACED IMMEDIATELY !!!
+          {% endif %}
+
+    # --- Create output file with results ---
+    - name: Create output file for {{ inventory_hostname }}/{{ disk_name }}
+      copy:
+        content: |
+          ===== Host: {{ inventory_hostname }} ({{ disk_type }}) =====
+          <Checking disk {{ disk_name }}> [smartctl version: {{ smartctl_version | default('unknown') }} - {{ "JSON mode" if json_supported else "TEXT mode" }}]
+          {% if complete_output is defined %}
+          {{ complete_output }}
+          {% else %}
+          ERROR: Could not retrieve SMART data for /dev/{{ disk_name }} (Type: {{ disk_type }}).
+          Last error: {{ smart_error_message | trim }}
+          {% endif %}
+        dest: "/tmp/smart_result_{{ inventory_hostname }}_{{ disk_name }}.txt"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    # --- Display the file contents ---
+    - name: Display contents of result file for {{ inventory_hostname }}/{{ disk_name }}
+      shell: "cat /tmp/smart_result_{{ inventory_hostname }}_{{ disk_name }}.txt | expand -t 4"
+      delegate_to: localhost
+      become: false
+      register: cat_output
+      changed_when: false
+
+    # --- ALWAYS save output to smart_outputs variable (BEFORE any potential failures) ---
+    - name: Save SMART output to collection
+      set_fact:
+        smart_outputs: "{{ hostvars[inventory_hostname]['smart_outputs'] | default([]) + cat_output.stdout_lines }}"
+
+    # --- Clean up output file ---
+    - name: Clean up output file
+      file:
+        path: "/tmp/smart_result_{{ inventory_hostname }}_{{ disk_name }}.txt"
+        state: absent
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+  rescue:
+    # If anything fails in the block, make sure we still set the error flag
+    - name: Record failure during processing
+      set_fact:
+        has_disk_errors: true
+        disk_check_failed: true
+
+  when: >
+    not has_megaraid and 
+    ((json_supported|bool and smart_data_json is not none) or 
+     (not json_supported|bool and smart_data_text is not none))
+
+# --- HANDLE ERROR CASES: Display error message if no SMART data was retrieved and no MegaRAID disks were processed ---
+- name: Report SMART data retrieval failure
+  block:
+    - name: Create error output file
+      copy:
+        content: |
+          ===== Host: {{ inventory_hostname }} ({{ disk_type }}) =====
+          <Checking disk {{ disk_name }}> [smartctl version: {{ smartctl_version | default('unknown') }} - {{ "JSON mode" if json_supported else "TEXT mode" }}]
+          ERROR: Could not retrieve SMART data for /dev/{{ disk_name }} (Type: {{ disk_type }}).
+          Last error: {{ smart_error_message | trim }}
+        dest: "/tmp/smart_result_{{ inventory_hostname }}_{{ disk_name }}_error.txt"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: Display error file contents
+      shell: "cat /tmp/smart_result_{{ inventory_hostname }}_{{ disk_name }}_error.txt"
+      delegate_to: localhost
+      become: false
+      register: error_output
+      changed_when: false
+
+    # --- SAVE ERROR OUTPUT TO COLLECTION TOO ---
+    - name: Add error output to SMART output collection
+      set_fact:
+        smart_outputs: "{{ hostvars[inventory_hostname]['smart_outputs'] | default([]) + error_output.stdout_lines }}"
+
+    - name: Clean up error file
+      file:
+        path: "/tmp/smart_result_{{ inventory_hostname }}_{{ disk_name }}_error.txt"
+        state: absent
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+  when: >
+    (not has_megaraid and 
+     ((json_supported|bool and smart_data_json is none) or 
+      (not json_supported|bool and smart_data_text is none))) or 
+    (has_megaraid and not megaraid_found_disk)
+
+# This debug task just displays the error message but doesn't stop execution
+- name: Display critical disk error message
+  debug:
+    msg: |
+      ===== CRITICAL DISK ERRORS DETECTED =====
+      Host: {{ inventory_hostname }}
+      Device: /dev/{{ disk_name }}
+      
+      {% if (unc_errors is defined and unc_errors | length > 0) %}
+      UNC Errors Found: {{ unc_errors | length }} (ERROR CODE 40)
+      !!! DRIVE SHOULD BE REPLACED IMMEDIATELY !!!
+      {% endif %}
+      
+      {% if (idnf_errors is defined and idnf_errors | length > 0) %}
+      IDNF Errors Found: {{ idnf_errors | length }} (ERROR CODE 10)
+      !!! DRIVE SHOULD BE REPLACED IMMEDIATELY !!!
+      {% endif %}
+      
+      {% if failing_attributes is defined and failing_attributes | length > 0 %}
+      Critical SMART attributes found - DRIVE REQUIRES ATTENTION!
+      {% endif %}
+      
+      {% if failing_attributes_list is defined and failing_attributes_list | length > 0 %}
+      Critical SMART attributes found - DRIVE REQUIRES ATTENTION!
+      {% endif %}
+      
+      {% if disk_is_failing %}
+      !!! DISK IS FAILING (smartctl error code 64) - REQUIRES IMMEDIATE REPLACEMENT !!!
+      {% endif %}
+  when: has_critical_errors | default(false) or disk_is_failing | default(false)

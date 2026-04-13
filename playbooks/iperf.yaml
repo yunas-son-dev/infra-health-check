@@ -1,0 +1,24 @@
+---
+- name: Run iperf Test
+  hosts: all
+  vars_prompt:
+    - name: iperf_server
+      prompt: Enter the IP address of the iperf server
+      private: false
+    - name: iperf_port
+      prompt: Enter the port of the iperf server (default is 5001)
+      default: "5001"
+      private: false
+  tasks:
+    - name: Install iperf (Ubuntu/Debian)
+      ansible.builtin.apt:
+        name: iperf
+        state: present
+      become: true
+    - name: Run iperf against user-specified server
+      ansible.builtin.command: iperf -c {{ iperf_server }} -p {{ iperf_port }}
+      register: iperf_output
+      changed_when: false
+    - name: Show iperf output
+      ansible.builtin.debug:
+        var: iperf_output.stdout_lines

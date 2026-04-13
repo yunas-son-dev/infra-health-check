@@ -1,0 +1,12 @@
+---
+# Default variables for cpu_diagnosis role
+
+cpu_freq_threshold: 80   # Frequency percentage threshold below which a warning is issued
+cpu_temp_threshold: 80
+
+# Linux package variables based on current kernel (using ansible_kernel fact)
+linux_tools_common: "linux-tools-common"
+linux_tools: "linux-tools-{{ ansible_kernel }}"
+linux_cloud_tools: "linux-cloud-tools-{{ ansible_kernel }}"
+linux_modules_extra: "linux-modules-extra-{{ ansible_kernel }}"
+lm_sensors_pkg: "lm-sensors"

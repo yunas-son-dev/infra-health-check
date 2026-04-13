@@ -1,0 +1,7 @@
+---
+- name: Gather Network-Related Logs for Troubleshooting
+  hosts: all
+  become: true  # to run tasks as sudo
+  
+  roles:
+    - network_logs

@@ -1,0 +1,7 @@
+---
+- name: Drive Diagnosis
+  hosts: all
+  gather_facts: yes
+  become: true
+  roles:
+    - drive_diagnosis

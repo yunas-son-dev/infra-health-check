@@ -1,0 +1,24 @@
+---
+# --- Common system info ---
+
+- name: Gather hostname
+  ansible.builtin.command: hostname
+  register: system_hostname
+  changed_when: false
+
+- name: Gather uptime and load average
+  ansible.builtin.command: uptime
+  register: system_uptime
+  changed_when: false
+
+- name: Gather kernel version
+  ansible.builtin.command: uname -r
+  register: system_kernel
+  changed_when: false
+
+- name: Display system information
+  ansible.builtin.debug:
+    msg:
+      - "Hostname : {{ system_hostname.stdout }}"
+      - "Uptime   : {{ system_uptime.stdout }}"
+      - "Kernel   : {{ system_kernel.stdout }}"

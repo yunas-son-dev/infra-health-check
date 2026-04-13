@@ -1,0 +1,17 @@
+---
+# meta/main.yml for cpu_diagnosis role
+
+galaxy_info:
+  author: Yuna Son
+  description: "Role to diagnose CPU issues, including governor, frequency, and temperature diagnostics."
+  license: MIT
+  min_ansible_version: "2.9"
+  platforms:
+    - name: Debian
+      versions:
+        - all
+    - name: Windows
+      versions:
+        - all
+
+dependencies: []

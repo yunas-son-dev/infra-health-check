@@ -1,0 +1,56 @@
+---
+# --- NIC error check ---
+# For each network interface (excluding lo and docker0), fetches ethtool
+# statistics in a single call and calculates RX/TX error rates.
+# Issues a WARNING if the error rate on any interface exceeds 1%.
+
+- name: Get all network interfaces
+  ansible.builtin.shell: ifconfig -a | grep -oE '^[a-zA-Z0-9]+'
+  register: all_interfaces
+  changed_when: false
+  failed_when: false
+
+- name: Set interfaces to check (excluding lo and docker0)
+  ansible.builtin.set_fact:
+    check_interfaces: "{{ all_interfaces.stdout_lines | difference(['lo', 'docker0']) }}"
+
+- name: Check NIC error statistics for each interface
+  ansible.builtin.shell: |
+    stats=$(ethtool -S {{ item }} 2>/dev/null)
+    if [ -z "$stats" ]; then
+      echo "No ethtool stats available for {{ item }}"
+      exit 0
+    fi
+    rx_err=$(echo "$stats" | awk -F: '/rx_errors/  { gsub(/ /,"",$2); print $2; exit }')
+    tx_err=$(echo "$stats" | awk -F: '/tx_errors/  { gsub(/ /,"",$2); print $2; exit }')
+    rx_pkts=$(echo "$stats" | awk -F: '/rx_packets/ { gsub(/ /,"",$2); print $2; exit }')
+    tx_pkts=$(echo "$stats" | awk -F: '/tx_packets/ { gsub(/ /,"",$2); print $2; exit }')
+    [ -z "$rx_pkts" ] && rx_pkts=$(echo "$stats" | awk -F: '/rx_mcast_packets/ { gsub(/ /,"",$2); print $2; exit }')
+    [ -z "$tx_pkts" ] && tx_pkts=$(echo "$stats" | awk -F: '/tx_mcast_packets/ { gsub(/ /,"",$2); print $2; exit }')
+    rx_err=${rx_err:-0}
+    tx_err=${tx_err:-0}
+    rx_pkts=${rx_pkts:-1}
+    tx_pkts=${tx_pkts:-1}
+    # Multiply by 10000 to get hundredths-of-a-percent without floating point
+    rx_pct=$(echo "scale=4; $rx_err * 10000 / $rx_pkts" | bc 2>/dev/null || echo "0")
+    tx_pct=$(echo "scale=4; $tx_err * 10000 / $tx_pkts" | bc 2>/dev/null || echo "0")
+    echo "Interface: {{ item }}"
+    echo "  RX errors : $rx_err / $rx_pkts packets"
+    echo "  TX errors : $tx_err / $tx_pkts packets"
+    if (( $(echo "$rx_pct > 100 || $tx_pct > 100" | bc -l 2>/dev/null || echo 0) )); then
+      echo "  WARNING: NIC error rate exceeds 1% on {{ item }}"
+    else
+      echo "  NIC error rate within acceptable limits"
+    fi
+  register: nic_check_result
+  changed_when: false
+  failed_when: false
+  loop: "{{ check_interfaces }}"
+
+- name: Display NIC error check results
+  ansible.builtin.debug:
+    msg: "{{ item.stdout_lines }}"
+  loop: "{{ nic_check_result.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.stdout | default('') != ''

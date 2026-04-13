@@ -1,0 +1,16 @@
+---
+- name: Purge Zabbix Agent
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Purge existing Zabbix agent if installed
+      ansible.builtin.apt:
+        name: zabbix-agent
+        state: absent
+        purge: true
+
+    - name: Remove configuration file if it exists
+      ansible.builtin.file:
+        path: /etc/zabbix/zabbix_agentd.conf
+        state: absent

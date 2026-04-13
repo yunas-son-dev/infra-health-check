@@ -1,0 +1,169 @@
+---
+# --- Initial Setup and Checks ---
+- name: Gather minimal facts (like package manager)
+  setup:
+    gather_subset:
+      - '!all'
+      - 'pkg_mgr'
+
+- name: Install smartmontools
+  package:
+    name: smartmontools
+    state: present
+  become: true
+
+# --- Check for Read-Only Filesystem ---
+- name: Check if root filesystem is read-only
+  shell: "mount | grep ' on / ' | awk '{print $6}' | tr -d '()'"
+  register: mount_options
+  changed_when: false
+  ignore_errors: true
+
+- name: Fail if root filesystem is read-only
+  fail:
+    msg: "FATAL: Root filesystem ('/') is mounted read-only. Cannot proceed reliably."
+  when: mount_options.rc == 0 and "ro" in mount_options.stdout.split(",") and "rw" not in mount_options.stdout.split(",")
+
+# --- Identify root filesystem device ---
+- name: Check if root is on LVM
+  shell: "df / | tail -1 | awk '{print $1}'"
+  register: root_fs_device
+  changed_when: false
+
+- name: Set LVM flag
+  set_fact:
+    is_lvm: "{{ root_fs_device.stdout is search('/mapper/') }}"
+    root_device: "{{ root_fs_device.stdout }}"
+
+# --- Simplified and reliable MegaRAID detection ---
+- name: Check for MegaRAID controllers
+  shell: "lspci | grep -i raid || echo ''"
+  register: raid_controllers
+  changed_when: false
+  ignore_errors: true
+
+- name: Set MegaRAID flag if controller is present
+  set_fact:
+    has_megaraid: "{{ (raid_controllers.stdout != '') }}"
+
+- name: Set storage type based on detection
+  set_fact:
+    storage_type: "{{ 'MegaRAID' if has_megaraid else ('LVM' if is_lvm | bool else 'Standard') }}"
+
+# --- Check for software RAID (md) ---
+- name: Check for software RAID
+  shell: "cat /proc/mdstat 2>/dev/null | grep -q 'md' && echo 'true' || echo 'false'"
+  register: has_md_raid
+  changed_when: false
+  ignore_errors: true
+
+# --- Find physical disks for various storage types ---
+- name: Find physical disks behind software RAID
+  shell: "cat /proc/mdstat 2>/dev/null | grep -o 'sd[a-z]' | sort -u | head -1 || echo 'sda'"
+  register: md_physical_disk
+  changed_when: false
+  ignore_errors: true
+  when: has_md_raid.stdout | trim == 'true'
+
+- name: Find physical disk for LVM
+  shell: "pvs --noheadings -o pv_name | head -1 | awk '{print $1}' | sed 's|/dev/||' || echo 'sda'"
+  register: lvm_physical_disk
+  changed_when: false
+  ignore_errors: true
+  when: is_lvm | bool
+
+- name: Find physical disk for standard partition
+  shell: "echo {{ root_device | regex_replace('/dev/', '') | regex_replace('p?[0-9]+$', '') }}"
+  register: std_physical_disk
+  changed_when: false
+  ignore_errors: true
+  when: not is_lvm | bool
+
+# --- For MegaRAID systems ---
+- name: Set discovered disks based on storage type
+  set_fact:
+    discovered_disks: "{{ ['sda'] if has_megaraid else ([md_physical_disk.stdout | trim] if (has_md_raid.stdout | trim == 'true') else ([lvm_physical_disk.stdout | trim] if is_lvm else [std_physical_disk.stdout | trim])) }}"
+
+# --- Check smartctl version ---
+- name: Check smartctl version
+  command: "smartctl --version"
+  register: smartctl_version_output
+  changed_when: false
+  ignore_errors: true
+  become: true
+
+- name: Extract smartctl version number
+  set_fact:
+    smartctl_version: "{{ smartctl_version_output.stdout | regex_search('[0-9]+\\.[0-9]+') | first | float }}"
+  when: smartctl_version_output is defined and smartctl_version_output.stdout is defined
+
+- name: Determine if JSON is supported
+  set_fact:
+    json_supported: "{{ (smartctl_version|string|float) >= 7.0 }}"
+  when: smartctl_version is defined
+
+- name: Set JSON support to false if version check failed
+  set_fact:
+    json_supported: false
+  when: smartctl_version is not defined
+
+# Initialize the collection variable
+- name: Initialize SMART outputs collection
+  set_fact:
+    smart_outputs: []
+    has_disk_errors: false
+
+# --- Loop Through Disks for SMART Checks ---
+- name: Check SMART status for each disk
+  include_tasks: smart_check_loop.yml
+  loop: "{{ discovered_disks }}"
+  loop_control:
+    loop_var: disk_name
+
+# First display any warnings if the host has disk errors
+- name: Display disk error warning if applicable
+  debug:
+    msg: "!!! WARNING: {{ inventory_hostname }} has critical disk errors that require immediate attention !!!"
+  when: hostvars[inventory_hostname]['has_disk_errors'] | default(false) or hostvars[inventory_hostname]['disk_is_failing'] | default(false)
+  ignore_errors: true
+
+# Then display the SMART data in JSON format
+- name: Display SMART results
+  debug:
+    var: hostvars[inventory_hostname]['smart_outputs']
+  ignore_errors: true
+
+# --- Generate summary of all hosts ---
+- name: SMART Check Summary
+  debug:
+    msg: |
+      ===== SMART CHECK SUMMARY =====
+      {% set error_hosts = [] %}
+      {% for host in ansible_play_hosts %}
+        {% if hostvars[host].get('failing_attributes', []) | length > 0 or 
+              hostvars[host].get('failing_attributes_list', []) | length > 0 or 
+              hostvars[host].get('has_disk_errors', false)|bool or
+              hostvars[host].get('disk_is_failing', false)|bool %}
+          {% set _ = error_hosts.append(host) %}
+        {% endif %}
+      {% endfor %}
+      
+      Total hosts checked: {{ ansible_play_hosts | length }}
+      Hosts with disk problems: {{ error_hosts | length }}
+      {% if error_hosts | length > 0 %}
+        {% for host in error_hosts %}
+      - {{ host }}
+        {% endfor %}
+      {% else %}
+      All disks passed health checks
+      {% endif %}
+  delegate_to: localhost
+  run_once: true
+  ignore_errors: true
+
+# --- Mark hosts as failed if disk problems were detected ---
+- name: Mark host as failed in final playbook status if disk errors were found
+  fail:
+    msg: "This host has critical disk errors that require attention"
+  when: has_disk_errors | bool or disk_is_failing | default(false)
+  ignore_errors: false  # This causes the host to be marked as failed

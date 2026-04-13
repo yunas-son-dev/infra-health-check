@@ -1,0 +1,29 @@
+---
+- name: Ensure ipmitool is installed
+  package:
+     name: ipmitool
+     state: present
+
+- name: Check PSU status
+  command: ipmitool sdr type 'Power Supply'
+  register: ps_result
+  changed_when: false
+  failed_when: false  
+
+- name: Handle missing PSU data
+  block:
+    - name: Skip if PSU status is unavailable
+      debug:
+        msg: "SKIPPED: PSU status is not available on this system."
+      when: ps_result.stdout | length == 0
+  when: ps_result.stdout | length == 0
+
+- name: Force failure if PSU failure is detected
+  fail:
+    msg: "PSU failure detected!"
+  when: "'Fail' in ps_result.stdout"
+
+- name: Display PSU status
+  debug:
+    msg: "{{ ps_result.stdout_lines }}"
+  when: ps_result.stdout | length > 0

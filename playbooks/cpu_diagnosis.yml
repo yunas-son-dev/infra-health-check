@@ -1,0 +1,7 @@
+---
+- name: CPU Diagnosis
+  hosts: all
+  gather_facts: yes
+  become: true
+  roles:
+    - cpu_diagnosis

@@ -1,0 +1,323 @@
+---
+# Main tasks for CPU diagnosis
+
+- name: Set OS type fact for diagnosis
+  set_fact:
+    os_type: >-
+      {%- if ansible_facts.os_family == "Windows" or ansible_facts.os_family.startswith("CYGWIN") -%}
+      Windows
+      {%- else -%}
+      {{ ansible_facts.os_family }}
+      {%- endif -%}
+
+- name: Print OS Type
+  debug:
+    msg: >
+      OS Type: {{ os_type }}
+
+- block:
+    - name: Ensure required Linux packages are installed
+      apt:
+        name:
+          - "{{ linux_tools_common }}"
+          - "{{ linux_tools }}"
+          - "{{ linux_cloud_tools }}"
+          - "{{ linux_modules_extra }}"
+          - "{{ lm_sensors_pkg }}"
+        state: present
+        update_cache: yes
+      when: os_type == "Debian"
+
+    - name: Set CPU governor to performance
+      shell: "cpupower frequency-set --governor performance"
+      register: governor_set
+      changed_when: "'performance' in (governor_set.stdout | default(''))"
+      when: os_type == "Debian"
+
+    - name: Load coretemp module
+      shell: "modprobe coretemp"
+      register: modprobe_result
+      changed_when: (modprobe_result.rc | default(0)) == 0
+      when: os_type == "Debian"
+
+    - name: Ensure coretemp is persistent on boot
+      lineinfile:
+        path: /etc/modules
+        line: "coretemp"
+        state: present
+      when: os_type == "Debian"
+
+    - name: Display CPU details using gathered facts
+      debug:
+        msg: >
+          CPU Vendor: {{ ansible_processor[1] | default('N/A') }},
+          Model name: {{ ansible_processor[2] | default('N/A') }},
+          CPU(s): {{ ansible_processor_nproc | default('N/A') }},
+          Core(s) per socket: {{ ansible_processor_cores | default('N/A') }}
+      when: os_type == "Debian"
+
+    - name: Get current CPU governor info
+      shell: "cpupower frequency-info | grep 'The governor'"
+      register: cpu_governor
+      changed_when: false
+      when: os_type == "Debian"
+
+    - name: Display CPU Governor
+      debug:
+        msg: "CPU Governor: {{ cpu_governor.stdout | trim }}"
+      when: os_type == "Debian"
+
+    - name: Get current CPU MHz (Linux)
+      shell: |
+        current=$(lscpu | awk -F ':' '/^CPU MHz/ {gsub(/ /, "", $2); print $2}')
+        if [ -z "$current" ]; then
+          current=$(awk -F: '/cpu MHz/ { print $2; exit }' /proc/cpuinfo | xargs)
+        fi
+        echo $current
+      register: current_cpu_mhz
+      changed_when: false
+      when: os_type == "Debian"
+
+    - name: Get max CPU MHz (Linux)
+      shell: "lscpu | grep 'CPU max MHz' | awk '{print $4}'"
+      register: max_cpu_mhz
+      changed_when: false
+      when: os_type == "Debian"
+
+    - name: Calculate CPU frequency percentage
+      shell: |
+        current=$(echo "{{ current_cpu_mhz.stdout }}" | cut -d. -f1)
+        max=$(echo "{{ max_cpu_mhz.stdout }}" | cut -d. -f1)
+        if [ -z "$current" ] || [ -z "$max" ] || [ "$max" -eq 0 ]; then
+          echo 0
+        else
+          percent=$(( current * 100 / max ))
+          echo $percent
+        fi
+      register: freq_percent_result
+      changed_when: false
+      when: os_type == "Debian"
+
+    - name: Display CPU Frequency Information
+      debug:
+        msg: >
+          Current CPU MHz: {{ current_cpu_mhz.stdout | trim }},
+          Max CPU MHz: {{ max_cpu_mhz.stdout | trim }},
+          Frequency Percentage: {{ freq_percent_result.stdout }}%
+      when: os_type == "Debian"
+
+    - name: Evaluate CPU Frequency (Debian)
+      debug:
+        msg: "PASS: CPU frequency is normal ({{ freq_percent_result.stdout }}%)"
+      failed_when: (freq_percent_result.stdout | int) < cpu_freq_threshold
+      when: os_type == "Debian"
+
+    - name: Gather raw CPU temperature readings
+      shell: "cat /sys/class/thermal/thermal_zone*/temp"
+      register: cpu_temps_raw
+      changed_when: false
+      when: os_type == "Debian"
+
+    - name: Calculate average CPU temperature
+      shell: |
+        temps=({{ cpu_temps_raw.stdout | regex_replace('\n', ' ') }})
+        sum=0
+        count=0
+        for temp in "${temps[@]}"; do
+          sum=$(( sum + temp ))
+          count=$(( count + 1 ))
+        done
+        if [ $count -eq 0 ]; then
+          echo 0
+        else
+          # Convert from millidegree to Celsius
+          avg=$(( sum / (count * 1000) ))
+          echo $avg
+        fi
+      register: avg_temp
+      changed_when: false
+      when: os_type == "Debian"
+      args:
+        executable: /bin/bash
+
+    - name: Display Average CPU Temperature
+      debug:
+        msg: "Average CPU Temperature: {{ avg_temp.stdout }} °C"
+      when: os_type == "Debian"
+
+    - name: Evaluate average CPU temperature (Debian)
+      debug:
+        msg: "PASS: CPU temperature is acceptable ({{ avg_temp.stdout }}°C)"
+      failed_when: (avg_temp.stdout | int) > cpu_temp_threshold
+      when: os_type == "Debian"
+
+    - name: Get detailed sensor output
+      shell: "sensors coretemp-isa-0000"
+      register: sensors_output
+      changed_when: false
+      when: os_type == "Debian"
+
+    - name: Display Sensors Output
+      debug:
+        msg: "Sensors Output: {{ sensors_output.stdout }}"
+      when: os_type == "Debian"
+
+    - name: Check if max_cstate is set to 1
+      shell: cat /sys/module/intel_idle/parameters/max_cstate
+      register: max_cstate
+      changed_when: false
+      when: os_type == "Debian"
+
+    - name: Check if modprobe is available inside the machine
+      shell: hash modprobe 2>/dev/null
+      ignore_errors: true
+      register: modprobe_check
+      when: os_type == "Debian"
+
+    - name: Install msr-tools if modprobe is available
+      apt:
+        name: msr-tools
+        state: present
+      when: os_type == "Debian" and modprobe_check.rc != 0
+
+    - name: Check if turbo boost is enabled
+      shell: |
+          modprobe msr
+          turbo_stat=$(rdmsr -a 0x1a0 -f 38:38 | awk '{ sum+=$1 } END { print sum/NR }')
+          if [ "$turbo_stat" = "0" ]; then
+              turbo_stat="ON"
+              echo "$turbo_stat"
+          elif [ "$turbo_stat" = "1" ]; then
+              turbo_stat="OFF"
+              echo "$turbo_stat"
+          else
+              turbo_stat="ErrorGettingStatus"
+              echo "$turbo_stat"
+          fi
+      register: turbo_boost
+      changed_when: false
+      when: os_type == "Debian"
+
+    - name: Display max_cstate and turbo_boost results and separate them with a new line
+      debug:
+        msg: 
+          - "Max C-state: {{ max_cstate.stdout }}"
+          - "Turbo Boost: {{ turbo_boost.stdout }}"
+      when: os_type == "Debian"
+
+- block:
+    - name: Get CPU information on Windows using WMIC
+      shell: >
+        cmd.exe /c "wmic CPU get Name,CurrentClockSpeed,LoadPercentage /format:list < NUL"
+      register: cpu_info_win
+      when: os_type == "Windows"
+
+    - name: Display Windows CPU Info
+      debug:
+        msg: "Windows CPU Info: {{ cpu_info_win.stdout }}"
+      when: os_type == "Windows"
+
+    - name: Get detailed CPU info on Windows using WMIC
+      shell: >
+        cmd.exe /c "wmic CPU get Name,NumberOfCores,NumberOfLogicalProcessors /format:list < NUL"
+      register: win_cpu_info_detailed
+      when: os_type == "Windows"
+
+    - name: Parse and display Windows CPU details from WMIC output
+      debug:
+        msg: >
+          {%- set cpu_info = {} -%}
+          {%- for line in win_cpu_info_detailed.stdout.splitlines() if "=" in line -%}
+            {%- set parts = line.split("=", 1) -%}
+            {%- set _ = cpu_info.update({ parts[0].strip(): parts[1].strip() }) -%}
+          {%- endfor -%}
+          CPU Model: {{ cpu_info.get('Name', 'N/A') }},
+          Cores: {{ cpu_info.get('NumberOfCores', 'N/A') }},
+          Logical CPUs: {{ cpu_info.get('NumberOfLogicalProcessors', 'N/A') }}
+      when: os_type == "Windows"
+
+    - name: Get CPU clock speeds on Windows using WMIC
+      shell: >
+        cmd.exe /c "wmic CPU get CurrentClockSpeed,MaxClockSpeed /format:list < NUL"
+      register: win_cpu_speed
+      changed_when: false
+      when: os_type == "Windows"
+
+    - name: Parse Windows CPU clock speeds
+      set_fact:
+        current_mhz: "{{ (win_cpu_speed.stdout.splitlines() | select('match', '^CurrentClockSpeed=') | list | first | regex_replace('CurrentClockSpeed=', '') | trim) | int }}"
+        max_mhz: "{{ (win_cpu_speed.stdout.splitlines() | select('match', '^MaxClockSpeed=') | list | first | regex_replace('MaxClockSpeed=', '') | trim) | int }}"
+      when: os_type == "Windows"
+
+    - name: Calculate CPU frequency percentage on Windows
+      set_fact:
+        freq_percent_win: "{{ (current_mhz|int * 100) // (max_mhz|int) if (max_mhz|int) != 0 else 0 }}"
+      when: os_type == "Windows"
+
+
+    - name: Display Windows CPU Frequency Information
+      debug:
+        msg: "Current CPU MHz: {{ current_mhz }}, Max CPU MHz: {{ max_mhz }}, Frequency Percentage: {{ freq_percent_win }}%"
+      when: os_type == "Windows"
+
+    - name: Evaluate Windows CPU Frequency
+      debug:
+        msg: "PASS: CPU frequency is normal ({{ freq_percent_win }}%)"
+      failed_when: (freq_percent_win | int) < cpu_freq_threshold
+      when: os_type == "Windows"
+
+    - name: Get Windows CPU temperature using WMIC (if available)
+      shell: >
+        cmd.exe /c "wmic /namespace:\\\\root\\wmi PATH MSAcpi_ThermalZoneTemperature get CurrentTemperature /format:list < NUL"
+      register: win_cpu_temp
+      changed_when: false
+      # Do not fail if rc is 12, which indicates "Not supported"
+      failed_when: win_cpu_temp.rc not in [0, 12]
+      when: os_type == "Windows"
+
+
+    - name: Convert and display Windows CPU temperature
+      debug:
+        msg: >
+          {%- if win_cpu_temp.stdout is defined and win_cpu_temp.stdout|length > 0 -%}
+            {# WMIC returns the temperature in tenths of Kelvin. Convert to Celsius: (value/10 - 273.15) #}
+            {%- set lines = win_cpu_temp.stdout.splitlines() -%}
+            {%- set temps = lines | select("match", "^CurrentTemperature=") | list -%}
+            {%- if temps|length > 0 -%}
+              {%- set temp_value = temps[0].split("=")[1]|float -%}
+              {%- set temp_c = (temp_value / 10) - 273.15 -%}
+              CPU Temperature: {{ temp_c|round(1) }} °C
+            {%- else -%}
+              No temperature data found.
+            {%- endif -%}
+          {%- else -%}
+            No temperature data available.
+          {%- endif -%}
+      when: os_type == "Windows"
+
+    - name: Convert and set Windows CPU temperature fact
+      set_fact:
+        win_temp_c: >-
+          {%- if win_cpu_temp.rc == 12 -%}
+          Not Supported
+          {%- else -%}
+          {%- set lines = win_cpu_temp.stdout.splitlines() -%}
+          {%- set temps = lines | select("match", "^CurrentTemperature=") | list -%}
+          {%- if temps|length > 0 -%}{{ ((temps[0].split("=")[1]|float) / 10) - 273.15 }}
+          {%- else -%}
+          No temperature data available.
+          {%- endif -%}
+          {%- endif -%}
+      when: os_type == "Windows"
+
+
+    - name: Evaluate Windows CPU Temperature
+      debug:
+        msg: >
+          {%- if (win_temp_c | float) > cpu_temp_threshold -%}
+          FAIL: Windows CPU temperature is too high ({{ (win_temp_c | float) | round(1) }} °C)
+          {%- else -%}
+          PASS: Windows CPU temperature is acceptable ({{ (win_temp_c | float) | round(1) }} °C)
+          {%- endif -%}
+      failed_when: (win_temp_c | float) > cpu_temp_threshold
+      when: os_type == "Windows" and win_temp_c != "Not Supported"

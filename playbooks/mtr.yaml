@@ -1,0 +1,41 @@
+---
+- name: Run MTR from Target Host
+  hosts: all
+  gather_facts: false
+  vars_prompt:
+    - name: target_host
+      prompt: Enter the target host to run MTR against
+      private: false
+    - name: cycles
+      prompt: Enter the number of cycles to run MTR
+      private: false
+  tasks:
+    - name: Check if MTR is installed
+      ansible.builtin.command: which mtr
+      register: mtr_installed
+      changed_when: false
+      ignore_errors: true
+
+    - name: Install MTR if not installed (Ubuntu/Debian)
+      ansible.builtin.apt:
+        name: mtr
+        state: present
+      when: mtr_installed.rc != 0
+      become: true
+
+    - name: Install MTR if not installed (RedHat/CentOS)
+      ansible.builtin.yum:
+        name: mtr
+        state: present
+      when: mtr_installed.rc != 0
+      become: true
+
+    - name: Run MTR against user-specified target host
+      ansible.builtin.command: >
+        mtr --report --report-cycles {{ cycles }} {{ target_host }}
+      register: mtr_output
+      changed_when: false
+
+    - name: Show MTR output
+      ansible.builtin.debug:
+        var: mtr_output.stdout_lines

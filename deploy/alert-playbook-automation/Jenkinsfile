@@ -1,0 +1,438 @@
+// Shared library configured in Jenkins — not included in this repo
+
+def PLAYBOOK_RESULTS_STRUCTURED = [:] // Initialize shared structure for playbook results
+def MACHINE_DETAILS_DATA = [:]
+
+pipeline {
+    environment {
+        // --- Environment Variables ---
+        // Set this credential ID in your Jenkins credentials store
+        ZENDESK_AUTH_DEV = credentials('')
+        // Your Zendesk subdomain, e.g. https://yourcompany.zendesk.com
+        ZENDESK_HOST_DEV = ""
+        // Set this credential ID in your Jenkins credentials store
+        ZENDESK_AUTH_PROD = credentials('')
+        // Your Zendesk subdomain, e.g. https://yourcompany.zendesk.com
+        ZENDESK_HOST_PROD = ""
+        // Janitor API is an internal inventory system that resolves Machine IDs to IPs.
+        // Replace with your own inventory source (e.g. a CMDB, Netbox, or static inventory file).
+        JANITOR_API_AUTH = credentials('')
+        JANITOR_API_URL = ""
+        DOCKER_IMAGE = ""
+        ANSIBLE_USER = "deploybot"
+        SSH_KEY_PATH_ON_AGENT = "${env.HOME}/.ssh/deploybot"          // Path to SSH key on Jenkins agent
+        SSH_KEY_PATH_IN_CONTAINER = "/root/.ssh/deploybot"     // Path to SSH key inside Docker container
+        LIBRARY_SRC_DIR = 'cicd-shared-src' // Temporary directory name to check out library source
+        USER_ACCOUNT = "deploybot"
+        SSH_KEY_CREDENTIAL_ID = "" // deploybot SSH key Credential ID
+        // Configure this job name to match your Jenkins setup
+        SUB_JOB_NAME = "XX_Playbook_Executor"
+    }
+    agent any
+    parameters {
+        // --- Pipeline Parameters ---
+        string(name: 'Branch', defaultValue: 'main', description: 'Ansible repository branch to checkout.')
+        string(name: 'MachineID', description: "Comma separated list of Machine IDs to process.")
+        string(name: 'ZDTicketID', description: 'Zendesk TicketID to update.')
+        choice(name: 'AlertNameTag', description: 'The Alert Name Tag to determine which playbooks to run.', choices: ['alertname:nic_errors', 'alertname:cpu_freq', 'alertname:cpu_idle', 'alertname:cpu_temp', 'alertname:high_mem', 'alertname:mem_error'])
+        choice(name: 'ZendeskEnv', description: 'The Zendesk environment to use', choices: ['prod','dev'])
+    }
+    stages {
+        stage('Initialize') {
+            steps {
+                script {
+                    echo "Branch: ${params.Branch}"
+                    echo "ZDTicketID: ${params.ZDTicketID}"
+                    echo "ZendeskEnv: ${params.ZendeskEnv}"
+                    echo "MachineID List: ${params.MachineID}"
+                    echo "AlertNameTag: ${params.AlertNameTag}"
+
+                    if (params.ZendeskEnv == "prod") {
+                        env.ACTIVE_ZENDESK_AUTH = env.ZENDESK_AUTH_PROD
+                        env.ACTIVE_ZENDESK_HOST = env.ZENDESK_HOST_PROD
+                    } else {
+                        env.ACTIVE_ZENDESK_AUTH = env.ZENDESK_AUTH_DEV
+                        env.ACTIVE_ZENDESK_HOST = env.ZENDESK_HOST_DEV
+                    }
+                    echo "Using Zendesk Host: ${env.ACTIVE_ZENDESK_HOST}"
+
+                    // Git Repository Clone/Update
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: params.Branch]],
+                        userRemoteConfigs: [[url: 'https://github.com/your-org/your-repo.git']], // Configure this URL to point to your repository
+                        extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'ansible-repo']]
+                    ])
+                    echo "INFO: Git repository prepared successfully!"
+                    // Stash the repo for sub-jobs
+                    stash includes: 'ansible-repo/**/*', name: 'ansibleRepo'
+
+                    // Initialize
+                    PLAYBOOK_RESULTS_STRUCTURED.clear() // Clear any previous results
+                    MACHINE_DETAILS_DATA.clear() // Clear any previous machine details
+                    def machineIdsForInit = params.MachineID.tokenize(',')
+                    machineIdsForInit.each { machineId ->
+                        PLAYBOOK_RESULTS_STRUCTURED[machineId.trim()] = []
+                    }
+                    echo "Initialized PLAYBOOK_RESULTS_STRUCTURED for ${machineIdsForInit.size()} machines."
+                }
+            }
+        }
+
+        stage('Prepare Playbooks & Machine Details') {
+            steps {
+                script {
+                    // Map of alert names to playbooks
+                    def alertPlaybookMap = [
+                        "alertname:nic_errors": "ifconfig.yaml,network_logs.yaml",
+                        "alertname:cpu_freq": "cpu_diagnosis.yml,psu_check.yaml",
+                        "alertname:cpu_idle": "cpu_diagnosis.yml,drive_diagnosis.yml",
+                        "alertname:cpu_temp": "drive_diagnosis.yml,psu_check.yaml,fan_speed.yml",
+                        "alertname:high_mem": "ram_check.yaml,psu_check.yaml",
+                        "alertname:mem_error": "ram_check.yaml",
+                        "Machine Report": "network_logs.yaml,psu_check.yaml,drive_diagnosis.yml,ram_check.yaml,fan_speed.yml,cpu_diagnosis.yml"
+                    ]
+
+                    // Validate and fetch playbooks for the selected alert
+                    env.SELECTED_PLAYBOOKS_STRING = alertPlaybookMap[params.AlertNameTag]
+                    if (!env.SELECTED_PLAYBOOKS_STRING) {
+                        error "ERROR: Invalid Alert Name Tag or no playbooks found for '${params.AlertNameTag}'"
+                    }
+                    echo "INFO: Selected Playbooks: ${env.SELECTED_PLAYBOOKS_STRING}"
+
+                    // Split Machine IDs input into a list, ensuring each ID is trimmed.
+                    def machineIdsList = params.MachineID.tokenize(',').collect { it.trim() }.findAll { it } // Filter out empty strings
+                    if (machineIdsList.isEmpty()) {
+                        // If no valid machine IDs are provided, log a warning and skip processing
+                        echo "WARN: No valid Machine IDs provided after trimming. Skipping machine details processing."
+                        return
+                    }
+                    echo "INFO: Total Machines to process: ${machineIdsList.size()}"
+
+                    // Fetch Machine Details via Janitor API
+                    echo "INFO: Fetching Machine Details from Janitor API..."
+
+                    machineIdsList.each { machineId ->
+                        if (machineId) { //it's always true, but just in case
+                            def detailsMap = janitor.getMachineDetails(env.JANITOR_API_URL, env.JANITOR_API_AUTH, machineId)
+
+                            // Store details and handle issues in the global MACHINE_DETAILS_DATA map
+                            MACHINE_DETAILS_DATA[machineId] = detailsMap
+                            if (detailsMap.error || detailsMap.ip == "N/A" || detailsMap.ip == "Error" || !detailsMap.ip) { //
+                                echo "WARNING: Problem fetching details or invalid IP for Machine ID: ${machineId}. IP=${detailsMap.ip ?: 'N/A'}, Error=${detailsMap.error ?: 'No specific error'}"
+                            } else {
+                                echo "INFO: Fetched Machine ID ${machineId}: IP=${detailsMap.ip}, Location=${detailsMap.location ?: 'N/A'}, Provider=${detailsMap.provider ?: 'N/A'}"
+                            }
+                        }
+                    }
+
+                    // Generate HTML summary table for the fetched machine details using the global MACHINE_DETAILS_DATA
+                    def machineDetailsHtmlContent = janitor.generateAllMachineDetailsTable(MACHINE_DETAILS_DATA, machineIdsList.join(','))
+                    echo "INFO: Machine Details HTML content generated."
+
+                    // Update Zendesk ticket with fetched machine details
+                    if (params.ZDTicketID && !params.ZDTicketID.trim().isEmpty() && !params.ZDTicketID.trim().equalsIgnoreCase("null")) {
+                        echo "INFO: Updating Zendesk ticket ${params.ZDTicketID.trim()} with Machine Details..."
+                        zendeskUpdater.updateTicketWithHtmlComment(
+                            env.ACTIVE_ZENDESK_HOST,        
+                            env.ACTIVE_ZENDESK_AUTH, 
+                            params.ZDTicketID.trim(),
+                            machineDetailsHtmlContent,      // Use the locally generated HTML content
+                            false                           // isPublic
+                        )
+                        //Success/fail logging is handled in the zendeskUpdater method
+                    } else {
+                        echo "WARN: Invalid, empty, or 'null' Zendesk Ticket ID provided ('${params.ZDTicketID}'). Skipping machine details update to Zendesk."
+                    }
+                }
+            }
+        }
+
+
+        stage('Execute Playbooks in Parallel') {
+            steps {
+                script {
+                    def machineIds = params.MachineID.tokenize(',').collect { it.trim() } // Tokenize Machine IDs from input parameters
+                    def playbooksToRun = env.SELECTED_PLAYBOOKS_STRING.tokenize(',').collect { it.trim() } // Get Playbooks to run for the selected alert
+                    // def parallelTasks = [:] // This variable is not used, can be removed.
+                    def tasksToRunInParallel = [:] // actual tasks to run in parallel
+
+                    machineIds.each { machineId -> // Iterate over each Machine ID
+                        def machineInfo = MACHINE_DETAILS_DATA[machineId] // Fetch machine details from the map
+
+                        if (!machineInfo || machineInfo.ip == "N/A" || machineInfo.ip == "Error" || machineInfo.error) {
+                            echo "WARNING: Skipping playbooks for Machine ID ${machineId} due to missing/invalid IP or previous fetch error (${machineInfo?.error ?: 'N/A'})."
+                            def mainJobConsoleUrl = "${env.BUILD_URL}console"
+                            def mainJobLinkHtml = "<a href='${mainJobConsoleUrl}' target='_blank'>View Logs</a>"
+                            // PLAYBOOK_RESULTS_STRUCTURED[machineId] is initialized to [] in the initialize stage
+                            PLAYBOOK_RESULTS_STRUCTURED[machineId] = [[ // allocate empty list for skipped machine
+                                playbook: "N/A",
+                                status: "Skipped (Machine Details Error: ${machineInfo?.error ?: 'Missing IP'})",
+                                logLinkHtml: mainJobLinkHtml
+                            ]]
+                            // exclude this machine from playbook execution
+                        } else {
+                            // create a task for valid machineId
+                            playbooksToRun.each { playbookName ->
+                                def taskName = "Machine_${machineId}_Playbook_${playbookName.tokenize('.')[0]}"
+                                tasksToRunInParallel[taskName] = {
+                                    def buildResultStatus = "Error (Job Trigger Failed)"
+                                    def subJobUrlValue = ""
+                                    def currentPlaybookName = playbookName
+                                    def currentMachineId = machineId
+                                    def currentMachineIp = machineInfo.ip
+                                    def actualSubJobBuild
+
+                                    try {
+                                        echo "Triggering sub-job for Machine ID: ${currentMachineId} (IP: ${currentMachineIp}), Playbook: ${currentPlaybookName}, Ansible Branch: ${params.Branch}"
+                                        actualSubJobBuild = build job: env.SUB_JOB_NAME,
+                                            parameters: [
+                                                string(name: 'MACHINE_IP', value: currentMachineIp),
+                                                string(name: 'PLAYBOOK_NAME', value: currentPlaybookName),
+                                                string(name: 'ANSIBLE_REPO_BRANCH', value: params.Branch)
+                                            ],
+                                            wait: true,
+                                            propagate: false // Do not propagate failure to the main job
+
+                                        //Get the URL if the sub-job build was triggered successfully
+                                        if (actualSubJobBuild != null) {
+                                            subJobUrlValue = actualSubJobBuild.getAbsoluteUrl()
+                                            buildResultStatus = (actualSubJobBuild.getResult() == 'SUCCESS') ? "Success" : "Fail"
+                                            if (buildResultStatus == "Fail" && actualSubJobBuild.getResult() != 'SUCCESS') { // Check if it's 'Fail' and not 'SUCCESS'
+                                                // If the sub-job fails, add the failure reason to the status
+                                                // def subJobFailureCause = actualSubJobBuild.getBuildCausesDescription() // This method might not exist or work as expected
+                                                echo "Sub-job ${taskName} failed. Result: ${actualSubJobBuild.getResult()}." // Removed .Cause as it might be null
+                                                buildResultStatus = "Fail (Result: ${actualSubJobBuild.getResult()})" // more detailed status
+                                            }
+                                        } else {
+                                            // build job failed to trigger
+                                            buildResultStatus = "Fail (Sub-job trigger failed or no build object returned)"
+                                        }
+                                        echo "Sub-job for ${taskName} completed with result: ${buildResultStatus}. URL: ${subJobUrlValue ?: 'N/A'}"
+
+                                    } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException fie) {
+                                        echo "FlowInterruptedException for ${taskName}: ${fie.getMessage()}"
+                                        buildResultStatus = "Fail (FlowInterruptedException)"
+                                        if (actualSubJobBuild != null && !subJobUrlValue) {
+                                           try { subJobUrlValue = actualSubJobBuild.getAbsoluteUrl() } catch (anyE) { /* ignore */ }
+                                        }
+                                    } catch (Exception e) {
+                                        echo "ERROR triggering or running sub-job ${taskName}: ${e.toString()}"
+                                        buildResultStatus = "Fail (Exception: ${e.toString()?.tokenize('\\n')[0]})"
+                                        //if the actualSubJobBuild object exists, we can try to get the URL
+                                        if (actualSubJobBuild != null && !subJobUrlValue) {
+                                           try { subJobUrlValue = actualSubJobBuild.getAbsoluteUrl() } catch (anyE) { /* ignore */ }
+                                        }
+                                    } finally {
+                                        // This block will always execute, regardless of success or failure
+                                        def logLinkHtml = subJobUrlValue ? "<a href='${subJobUrlValue}console' target='_blank'>View Logs</a>" : "N/A (URL not available)"
+
+                                        if (currentMachineId == null) {
+                                            echo "CRITICAL ERROR: currentMachineId is null for task ${taskName}."
+                                            return [
+                                                machineId: "UNKNOWN_IN_${taskName}",
+                                                playbook: currentPlaybookName ?: "N/A",
+                                                status: "Critical Error (machineId null)",
+                                                logLinkHtml: logLinkHtml
+                                            ]
+                                        }
+
+                                        return [
+                                            machineId: currentMachineId,
+                                            playbook: currentPlaybookName,
+                                            status: buildResultStatus,
+                                            logLinkHtml: logLinkHtml
+                                        ]
+                                    }
+                                } 
+                            } 
+                        } 
+                    } 
+
+                    def resultsFromParallelExecution = [:]
+                    if (tasksToRunInParallel.isEmpty()) {
+                        echo "No playbook tasks to execute in parallel."
+                    } else {
+                        try {
+                            def rawResults = parallel tasksToRunInParallel //   Execute the parallel tasks
+                            if (rawResults != null) {
+                                resultsFromParallelExecution = rawResults
+                            } else {
+                                // in case the parallel block returns null(rare case)
+                                echo "WARNING: 'parallel tasksToRunInParallel' returned null. Using empty map for results."
+                                // resultsFromParallelExecution has already been initialized to [:]
+                            }
+                        } catch (allParallelError) {
+                            //entire parallel block failed
+                            echo "ERROR occurred during the entire parallel execution block: ${allParallelError.toString()}"
+                            currentBuild.result = 'FAILURE' //mark the build as failed
+                            // resultsFromParallelExecution is still initialized to [:]
+                        }
+                    }
+
+                    //Collect results from parallel execution to PLAYBOOK_RESULTS_STRUCTURED
+                    resultsFromParallelExecution.each { taskName, resultItem ->
+                        //Check if resultItem is a valid map with machineId
+                        if (resultItem instanceof Map && resultItem.machineId) {
+                            //Check if PLAYBOOK_RESULTS_STRUCTURED has an entry for the machineId and initialize if not
+                            if (!PLAYBOOK_RESULTS_STRUCTURED.containsKey(resultItem.machineId)) {
+                                PLAYBOOK_RESULTS_STRUCTURED[resultItem.machineId] = []
+                            }
+
+                            //Add the result item to the structured results if it's not skipped
+                            if (PLAYBOOK_RESULTS_STRUCTURED[resultItem.machineId].isEmpty() ||
+                                !(PLAYBOOK_RESULTS_STRUCTURED[resultItem.machineId][0]?.status?.startsWith("Skipped"))) {
+                                PLAYBOOK_RESULTS_STRUCTURED[resultItem.machineId] << [
+                                    playbook: resultItem.playbook ?: "N/A",
+                                    status: resultItem.status ?: "Unknown",
+                                    logLinkHtml: resultItem.logLinkHtml ?: "N/A"
+                                ]
+                            }
+                        } else {
+                            // resultItem is null or is not Map or machineId does not exist
+                            echo "Warning: Task ${taskName} returned an invalid or null result item: ${resultItem?.toString()}" // resultItem can be null so use ?.
+                            // extract machineId and playbook name from taskName to record the error
+                            try {
+                                def parts = taskName.split("_")
+                                if (parts.size() >= 4 && parts[0] == "Machine") { // "Machine_ID_Playbook_Name" format
+                                    def machineIdFromTask = parts[1]
+                                    def playbookNameFromTask = parts[3] //Playbook name
+                                    if (machineIdFromTask) {
+                                        if (!PLAYBOOK_RESULTS_STRUCTURED.containsKey(machineIdFromTask)) {
+                                            PLAYBOOK_RESULTS_STRUCTURED[machineIdFromTask] = []
+                                        }
+                                        PLAYBOOK_RESULTS_STRUCTURED[machineIdFromTask] << [
+                                            playbook: "Error in task: ${playbookNameFromTask}",
+                                            status: "Failed (Invalid parallel task result)",
+                                            logLinkHtml: "N/A"
+                                        ]
+                                        echo "Recorded error for machine ${machineIdFromTask} (playbook: ${playbookNameFromTask}) from task ${taskName} due to invalid result."
+                                    }
+                                }
+                            } catch (e) {
+                                echo "Error trying to parse machineId/playbook from taskName '${taskName}' for invalid result item: ${e.getMessage()}"
+                            }
+                        }
+                    } 
+                } 
+            } 
+        } 
+
+        stage('Final Zendesk Update') {
+            steps {
+                script {
+                    if (!params.ZDTicketID) {
+                        echo "No ZDTicketID provided, skipping final Zendesk update."
+                        return
+                    }
+
+                    echo "DEBUG: Preparing to update Zendesk ticket ${params.ZDTicketID} with playbook execution summary."
+                    def finalHtml = new StringBuilder()
+                    finalHtml.append("<h3>Playbook Execution Summary</h3><br>")
+                    finalHtml.append("<style>table.playbook-summary { margin-bottom: 20px; border-collapse: collapse; width: 100%; } table.playbook-summary th, table.playbook-summary td { border: 1px solid #ddd; padding: 8px; text-align: left; } table.playbook-summary th { background-color: #f2f2f2; } .result-success { color: green; } .result-fail { color: red; font-weight: bold; } .result-skipped { color: orange; }</style>")
+
+                    // get machineIds from params.MachineID
+                    def machineIdsToUpdate = params.MachineID.tokenize(',').collect { it.trim() }
+
+                    machineIdsToUpdate.each { machineId ->
+                        def machineInfo = MACHINE_DETAILS_DATA[machineId] // MACHINE_DETAILS_DATA is already populated in the prepare stage
+                        def playbookResultsForMachine = PLAYBOOK_RESULTS_STRUCTURED[machineId]
+
+                        finalHtml.append("<h4>Results for Machine ID: ${machineId} (IP: ${machineInfo?.ip ?: 'N/A'})</h4>")
+                        if (playbookResultsForMachine && !playbookResultsForMachine.isEmpty()) {
+                            finalHtml.append("<table class='playbook-summary' border='1'><tr><th>Playbook</th><th>Result</th><th>Logs</th></tr>")
+                            playbookResultsForMachine.each { resultItem ->
+                                def statusClass = ""
+                                if (resultItem.status.toLowerCase().contains("success")) statusClass = "result-success"
+                                else if (resultItem.status.toLowerCase().contains("fail")) statusClass = "result-fail"
+                                else if (resultItem.status.toLowerCase().contains("skipped")) statusClass = "result-skipped"
+
+                                finalHtml.append("<tr><td>${resultItem.playbook}</td><td class='${statusClass}'>${resultItem.status}</td><td>${resultItem.logLinkHtml}</td></tr>")
+                            }
+                            finalHtml.append("</table><br>")
+                        } else {//if PLAYBOOK_RESULTS_STRUCTURED[machineId] is empty from the initialize stage
+                            // or the results were not recorded during the playbook execution stage for some reason
+                            finalHtml.append("<p>No playbook results recorded for this machine, or machine was skipped without explicit 'Skipped' status.</p><br>")
+                        }
+                    }
+
+                    //echo "DEBUG: Final HTML Content for Zendesk: ${finalHtml.toString()}"
+                    zendeskUpdater.updateTicketWithHtmlComment(
+                        env.ACTIVE_ZENDESK_HOST,
+                        env.ACTIVE_ZENDESK_AUTH,
+                        params.ZDTicketID,
+                        finalHtml.toString(),
+                        false // isPublic
+                    )
+                    echo "Zendesk ticket ${params.ZDTicketID} updated successfully with playbook results."
+                }
+            }
+        }    
+    }
+
+post {
+        always {
+            script {
+                echo "Pipeline finished with status: ${currentBuild.currentResult}"
+                // Determine if this is a downstream job
+                boolean isDownstreamBuild = false
+                try {
+                     // Check if this build was triggered by an upstream job
+                    def causes = currentBuild.getBuildCauses()
+                    for (def cause in causes) {
+                        if (cause instanceof hudson.model.Cause.UpstreamCause) {
+                            isDownstreamBuild = true
+                            echo "This build was triggered by an upstream job."
+                            break
+                        }
+                    }
+                } catch (MissingMethodException mme) {
+                    echo "Warning: Could not determine if this is a downstream build using getBuildCauses(). Method not found: ${mme.getMessage()}"
+                } catch (Exception e) {
+                    echo "Warning: An error occurred while trying to determine if this is a downstream build: ${e.getMessage()}"
+                    //Assume that isDownstreamBuild = false and proceed 
+                }
+                // Cleanup workspace (only for main job or directly triggered job)
+                if (!isDownstreamBuild) {
+                    echo "This is the main job or a directly triggered job (or downstream status unknown/error). Cleaning up workspace."
+                    node{
+                        deleteDir() // Cleans up the workspace, unstashed 'ansibleRepo' included
+                    }
+                } else {
+                    echo "This is a downstream job. Workspace cleanup skipped."
+                }
+                echo "Post-always tasks completed."
+            }
+        }
+        success {
+            script {
+                echo "Pipeline completed successfully."
+            }
+        }
+        failure {
+            script {
+                echo "Pipeline failed."
+                if (params.ZDTicketID && !params.ZDTicketID.trim().isEmpty() && !params.ZDTicketID.trim().equalsIgnoreCase("null")) {
+                    try {
+                        // Update Zendesk ticket with failure details
+                        zendeskUpdater.updateTicketWithHtmlComment(
+                            env.ACTIVE_ZENDESK_HOST,
+                            env.ACTIVE_ZENDESK_AUTH,
+                            params.ZDTicketID.trim(),
+                            "Pipeline failed. Please check the logs for further details: ${env.BUILD_URL}console",
+                            false
+                        )
+                    } catch (Exception e) {
+                        echo "Failed to update Zendesk ticket with failure message in post-failure: ${e.getMessage()}"
+                    }
+                } else {
+                    echo "WARN: Invalid or empty Zendesk Ticket ID provided. Skipping failure update to Zendesk."
+                }
+            }
+        }
+        cleanup {
+            script {
+                echo "Performing pipeline cleanup tasks."
+            }
+        }
+    }

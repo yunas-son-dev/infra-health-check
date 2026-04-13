@@ -1,0 +1,4 @@
+---
+# Default variables for RAM diagnostics
+
+ram_free_threshold_mb: 800  # Minimum free RAM threshold in MB

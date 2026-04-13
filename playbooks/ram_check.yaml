@@ -1,0 +1,8 @@
+---
+- name: Run RAM diagnostics
+  hosts: all
+  gather_facts: yes
+  become: true
+  roles:
+    - ram_check
+

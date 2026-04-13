@@ -1,0 +1,16 @@
+---
+- name: Install and Run ifconfig
+  hosts: all
+  become: true
+  tasks:
+    - name: Install net-tools for ifconfig
+      ansible.builtin.apt:
+        name: net-tools
+        state: present
+    - name: Run ifconfig
+      ansible.builtin.command: ifconfig
+      register: ifconfig_output
+      changed_when: false
+    - name: Display ifconfig output
+      ansible.builtin.debug:
+        msg: "{{ ifconfig_output.stdout }}"

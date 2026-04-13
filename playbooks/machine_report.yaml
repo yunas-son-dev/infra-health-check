@@ -1,0 +1,59 @@
+- name: Run full machine health report
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - block:
+        - name: Run RAM check
+          include_role:
+            name: ram_check
+          no_log: true
+      rescue:
+        - debug:
+            msg: "RAM check failed"
+
+    - block:
+        - name: Run CPU check
+          include_role:
+            name: cpu_diagnosis
+          no_log: true
+      rescue:
+        - debug:
+            msg: "CPU check failed"
+
+    - block:
+        - name: Run Drive check
+          include_role:
+            name: drive_diagnosis
+          no_log: true
+      rescue:
+        - debug:
+            msg: "Drive check failed"
+
+    - block:
+        - name: Run PSU check
+          include_role:
+            name: psu_check
+          no_log: true
+      rescue:
+        - debug:
+            msg: "PSU check failed"
+
+    - block:
+        - name: Run Fan Speed check
+          include_role:
+            name: fan_speed
+          no_log: true
+      rescue:
+        - debug:
+            msg: "Fan Speed check failed"
+
+    - block:
+        - name: Run Network Logs check
+          include_role:
+            name: network_logs
+          no_log: true
+      rescue:
+        - debug:
+            msg: "Network logs check failed"

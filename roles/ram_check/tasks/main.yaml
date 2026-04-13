@@ -1,0 +1,69 @@
+---
+# RAM diagnostics tasks (main code)
+
+# Task 1: Check Free RAM
+- name: Check free RAM
+  shell: free -m | awk '/^Mem:/ {print $4}'
+  register: free_memory
+  changed_when: false
+  failed_when: free_memory.stdout | int < ram_free_threshold_mb
+
+- name: Display free memory
+  debug:
+    msg: >
+      Free memory (in MB): {{ free_memory.stdout }}
+
+# Task 2: Display RAM Size
+- name: Gather RAM size
+  shell: dmidecode -t 17 | grep -E 'Size:|Locator:' | grep -v 'Bank Locator:' | paste - - -d ' '
+  register: ram_size
+  changed_when: false
+
+- name: Display RAM size
+  debug:
+    msg: >
+      RAM size and location (from dmidecode):
+      {{ ram_size.stdout }}
+
+# Task 3: RAM Error Check in Syslog for MC0 Errors
+- name: Check syslog for RAM errors (MC0 with unknown or CE)
+  shell: grep MC0 /var/log/syslog | grep -i 'unknown\|CE'
+  register: ram_errors_syslog
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display RAM error logs from syslog
+  debug:
+    msg: >
+      RAM errors in syslog:
+      {{ ram_errors_syslog.stdout if ram_errors_syslog.stdout else "No RAM errors found in syslog." }}
+  failed_when: ram_errors_syslog.stdout != ""
+  ignore_errors: yes
+
+# Task 4: RAM Error Check in dmesg for MC0 Errors
+- name: Check dmesg for RAM errors (MC0 with unknown or CE)
+  shell: dmesg -T | grep MC0 | grep -iE 'unknown|CE' | grep -v 'Giving out device to module' || true
+  register: ram_errors_dmesg_mc0
+  changed_when: false
+
+- name: Display RAM error logs from dmesg (MC0 errors)
+  debug:
+    msg: >
+      {{ "RAM errors in dmesg (MC0 - unknown or CE):" if ram_errors_dmesg_mc0.stdout != "" else "No RAM errors found in dmesg related to MC0." }}
+  failed_when: ram_errors_dmesg_mc0.stdout != ""
+  ignore_errors: yes
+
+# Task 5: General RAM Error Check in dmesg
+- name: Check dmesg for other RAM-related errors
+  shell: |
+    dmesg -l err -T | grep -Ev 'SGX disabled by BIOS|Timed out waiting for FW-initiated reset|ISH: hw start failed|kauditd hold queue overflow'
+  register: other_errors_dmesg
+  changed_when: false
+
+- name: Display other RAM-related logs from dmesg
+  debug:
+    msg: >
+      {{ "General errors in dmesg (may or may not be RAM-related):\n" + (other_errors_dmesg.stdout | trim) }}
+  failed_when: other_errors_dmesg.stdout | trim | length > 3
+  ignore_errors: yes
+
