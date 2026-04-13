@@ -1,0 +1,7 @@
+{
+  "SERVER-001": { "ip": "192.168.1.10", "location": "DC1", "provider": "On-prem" },
+  "SERVER-002": { "ip": "192.168.1.11", "location": "DC1", "provider": "On-prem" },
+  "SERVER-003": { "ip": "192.168.1.12", "location": "DC2", "provider": "On-prem" },
+  "SERVER-004": { "ip": "10.0.0.21",    "location": "DC2", "provider": "On-prem" },
+  "SERVER-005": { "ip": "10.0.0.22",    "location": "DC3", "provider": "Cloud"   }
+}

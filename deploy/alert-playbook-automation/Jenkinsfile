@@ -1,5 +1,19 @@
 // Shared library configured in Jenkins — not included in this repo
 
+def generateMachineDetailsTable(machineData) {
+    def html = new StringBuilder()
+    html.append("<table border='1' style='border-collapse:collapse;width:100%'>")
+    html.append("<tr><th>Machine ID</th><th>IP</th><th>Location</th><th>Provider</th></tr>")
+    machineData.each { id, details ->
+        def ip = details.ip ?: 'N/A'
+        def location = details.location ?: 'N/A'
+        def provider = details.provider ?: 'N/A'
+        html.append("<tr><td>${id}</td><td>${ip}</td><td>${location}</td><td>${provider}</td></tr>")
+    }
+    html.append("</table>")
+    return html.toString()
+}
+
 def PLAYBOOK_RESULTS_STRUCTURED = [:] // Initialize shared structure for playbook results
 def MACHINE_DETAILS_DATA = [:]
 
@@ -14,10 +28,10 @@ pipeline {
         ZENDESK_AUTH_PROD = credentials('')
         // Your Zendesk subdomain, e.g. https://yourcompany.zendesk.com
         ZENDESK_HOST_PROD = ""
-        // Janitor API is an internal inventory system that resolves Machine IDs to IPs.
-        // Replace with your own inventory source (e.g. a CMDB, Netbox, or static inventory file).
-        JANITOR_API_AUTH = credentials('')
-        JANITOR_API_URL = ""
+        // Janitor API — see janitor/ directory for the implementation.
+        // Set JANITOR_API_TOKEN in Jenkins credentials store, and JANITOR_API_URL to the service URL.
+        JANITOR_API_AUTH = credentials('')   // Bearer token for the Janitor API
+        JANITOR_API_URL = ""                 // e.g. http://your-janitor-host:5000
         DOCKER_IMAGE = ""
         ANSIBLE_USER = "deploybot"
         SSH_KEY_PATH_ON_AGENT = "${env.HOME}/.ssh/deploybot"          // Path to SSH key on Jenkins agent
@@ -114,7 +128,16 @@ pipeline {
 
                     machineIdsList.each { machineId ->
                         if (machineId) { //it's always true, but just in case
-                            def detailsMap = janitor.getMachineDetails(env.JANITOR_API_URL, env.JANITOR_API_AUTH, machineId)
+                            def response = httpRequest(
+                                url: "${env.JANITOR_API_URL}/machines/${machineId}",
+                                httpMode: 'GET',
+                                customHeaders: [[name: 'Authorization', value: "Bearer ${env.JANITOR_API_AUTH}"]],
+                                validResponseCodes: '200,404'
+                            )
+                            def detailsMap = readJSON text: response.content
+                            if (response.status == 404) {
+                                detailsMap.error = "Machine not found"
+                            }
 
                             // Store details and handle issues in the global MACHINE_DETAILS_DATA map
                             MACHINE_DETAILS_DATA[machineId] = detailsMap
@@ -127,7 +150,7 @@ pipeline {
                     }
 
                     // Generate HTML summary table for the fetched machine details using the global MACHINE_DETAILS_DATA
-                    def machineDetailsHtmlContent = janitor.generateAllMachineDetailsTable(MACHINE_DETAILS_DATA, machineIdsList.join(','))
+                    def machineDetailsHtmlContent = generateMachineDetailsTable(MACHINE_DETAILS_DATA)
                     echo "INFO: Machine Details HTML content generated."
 
                     // Update Zendesk ticket with fetched machine details
