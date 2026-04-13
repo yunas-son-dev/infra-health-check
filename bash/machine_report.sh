@@ -16,7 +16,7 @@
 #-    copyright       Copyright (c) Yuna Son
 #========================================================================
 # History
-#    2023-06-28 Started by Yuna Son & Julian T.G.
+#    2023-06-28 Started by Yuna Son
 #    2024-03-15 Released v1.0.0 by Yuna Son
 #    2024-11-28 Updated C-state check
 #========================================================================
